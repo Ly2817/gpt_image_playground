@@ -20,6 +20,11 @@ export const config = {
   maxJsonBytes: readInt('MAX_JSON_BYTES', 8 * 1024 * 1024),
   /** 代理转发的请求体上限，默认 512MB（图生图的输入图可能很大） */
   maxProxyBodyBytes: readInt('MAX_PROXY_BODY_BYTES', 512 * 1024 * 1024),
+  /**
+   * 是否允许代理访问内网/环回地址。默认关闭，防止把代理当成内网跳板（SSRF）。
+   * 只有对接部署在内网的自建模型服务时才需要打开。
+   */
+  allowPrivateProxy: process.env.ALLOW_PRIVATE_PROXY === 'true',
   /** 直连保护：容器端口直接暴露时仍要求 Basic 认证，留空则不启用 */
   basicAuthUser: process.env.BASIC_AUTH_USER ?? '',
   basicAuthPass: process.env.BASIC_AUTH_PASS ?? '',

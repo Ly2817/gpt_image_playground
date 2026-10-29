@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { lookup } from 'node:dns/promises'
 import { mkdirSync } from 'node:fs'
 import { config, paths, SERVER_MANAGED_KEY } from './config.js'
 import { basicAuthEnabled, configureBasicAuth, isAuthorized } from './auth.js'
@@ -18,6 +19,7 @@ import {
   registerImage,
   saveSharedConfig,
   upsertRecord,
+  type StoredProfile,
 } from './db.js'
 import { extFromMime, isValidImageId, loadImage, normalizeExt, saveImage } from './storage.js'
 import { serveIndexHtml, serveStatic } from './static.js'
@@ -223,11 +225,104 @@ function mergeProfilesWithStoredKey(incoming: unknown[]): unknown[] {
   })
 }
 
+const PRIVATE_IPV4 = [
+  /^0\./,
+  /^10\./,
+  /^127\./,
+  /^169\.254\./,
+  /^192\.168\./,
+  /^172\.(1[6-9]|2\d|3[01])\./,
+  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./,
+]
+
+/** 环回、内网、链路本地与云元数据地址一律视为不可访问 */
+function isPrivateIp(address: string): boolean {
+  const ip = address.toLowerCase()
+  if (ip === '::1' || ip === '::' || ip === '0.0.0.0') return true
+  if (ip.startsWith('fe80') || ip.startsWith('fc') || ip.startsWith('fd')) return true
+  if (ip.startsWith('::ffff:')) return isPrivateIp(ip.slice(7))
+  return PRIVATE_IPV4.some((pattern) => pattern.test(ip))
+}
+
+function isForbiddenHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '')
+  if (!host) return true
+  if (host === 'localhost' || host.endsWith('.localhost')) return true
+  if (host.endsWith('.internal') || host.endsWith('.local')) return true
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':')) return isPrivateIp(host)
+  return false
+}
+
+/** DNS 解析结果缓存，避免每次代理请求都查一次 */
+const dnsCache = new Map<string, { isPrivate: boolean; at: number }>()
+const DNS_CACHE_TTL = 60_000
+
+async function resolvesToPrivateAddress(hostname: string): Promise<boolean> {
+  const cached = dnsCache.get(hostname)
+  if (cached && Date.now() - cached.at < DNS_CACHE_TTL) return cached.isPrivate
+  let isPrivate = false
+  try {
+    const addresses = await lookup(hostname, { all: true })
+    isPrivate = addresses.length === 0 || addresses.some((entry) => isPrivateIp(entry.address))
+  } catch {
+    // 解析失败交给后续 fetch 报错，不在这里拦截
+    return false
+  }
+  dnsCache.set(hostname, { isPrivate, at: Date.now() })
+  return isPrivate
+}
+
+/** fal 的同步与队列接口分属两个域名，配置里只填了其中一个也要放行 */
+function isFalHost(hostname: string): boolean {
+  const host = hostname.toLowerCase()
+  return host === 'fal.run' || host.endsWith('.fal.run') || host === 'fal.ai' || host.endsWith('.fal.ai')
+}
+
+/**
+ * 校验转发目标。返回 null 表示允许，否则返回拒绝原因。
+ * 两道关卡：必须落在某个已配置 profile 的地址范围内，且不能是内网/环回/元数据地址。
+ * 否则任何拿到账号的人都能把这里当成内网跳板（SSRF）。
+ */
+async function rejectProxyTarget(profile: StoredProfile, target: URL): Promise<string | null> {
+  if (target.protocol !== 'http:' && target.protocol !== 'https:') return 'target 只支持 http/https'
+
+  const isFal = profile.provider === 'fal'
+  const baseRaw = (profile.baseUrl ?? '').trim() || (isFal ? 'https://fal.run' : '')
+  if (!baseRaw) return '该配置没有设置 API 地址'
+  let base: URL
+  try {
+    base = new URL(baseRaw)
+  } catch {
+    return '该配置的 API 地址不合法'
+  }
+
+  const sameOrigin = base.origin === target.origin || (isFal && isFalHost(target.hostname))
+  const basePath = base.pathname.replace(/\/+$/, '')
+  const pathAllowed =
+    !sameOrigin ? false
+      : isFal ? true
+        : basePath === '' || target.pathname === basePath || target.pathname.startsWith(`${basePath}/`)
+  if (!sameOrigin || !pathAllowed) {
+    return '只能转发到当前配置里设置的 API 地址'
+  }
+
+  if (!config.allowPrivateProxy) {
+    if (isForbiddenHostname(target.hostname)) return '不允许访问内网或环回地址'
+    if (await resolvesToPrivateAddress(target.hostname)) return '不允许访问内网或环回地址'
+  }
+  return null
+}
+
 /**
  * AI 请求代理：浏览器不再持有真实 Key。
  * 收到的请求按 profileId 找到服务端存的 Key 注入后再转发，响应（含流式）原样透传。
  */
 async function handleProxy(req: IncomingMessage, res: ServerResponse, query: URLSearchParams) {
+  const method = req.method ?? 'GET'
+  if (method !== 'GET' && method !== 'POST' && method !== 'HEAD') {
+    return fail(res, 405, '代理只支持 GET / POST / HEAD')
+  }
+
   const profileId = query.get('profile') ?? ''
   const target = query.get('target') ?? ''
   if (!target) return fail(res, 400, '缺少 target 参数')
@@ -238,16 +333,18 @@ async function handleProxy(req: IncomingMessage, res: ServerResponse, query: URL
   } catch {
     return fail(res, 400, 'target 不是合法 URL')
   }
-  if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') {
-    return fail(res, 400, 'target 只支持 http/https')
-  }
 
   const profile = findSharedProfile(profileId)
   if (!profile) return fail(res, 404, '找不到对应的 API 配置')
   const realKey = (profile.apiKey ?? '').trim()
   if (!realKey) return fail(res, 400, '该配置没有可用的 API Key')
 
-  const method = req.method ?? 'POST'
+  const rejection = await rejectProxyTarget(profile, targetUrl)
+  if (rejection) {
+    log(`proxy 拒绝 ${method} ${targetUrl.host}${targetUrl.pathname}: ${rejection}`)
+    return fail(res, 403, rejection)
+  }
+
   const hasBody = method !== 'GET' && method !== 'HEAD'
   const body = hasBody ? await readBody(req, config.maxProxyBodyBytes) : undefined
 
@@ -255,8 +352,8 @@ async function handleProxy(req: IncomingMessage, res: ServerResponse, query: URL
   for (const [name, value] of Object.entries(req.headers)) {
     if (!value) continue
     const lower = name.toLowerCase()
-    // 长度由 fetch 重算；accept-encoding 交给 fetch 自己协商
-    if (lower === 'host' || lower === 'content-length' || lower === 'connection' || lower === 'accept-encoding') continue
+    // 长度由 fetch 重算；accept-encoding 交给 fetch 协商；cookie 属于本站，不该带给上游
+    if (lower === 'host' || lower === 'content-length' || lower === 'connection' || lower === 'accept-encoding' || lower === 'cookie') continue
     headers[lower] = Array.isArray(value) ? value.join(', ') : String(value)
   }
   headers.authorization = profile.provider === 'fal' ? `Key ${realKey}` : `Bearer ${realKey}`
@@ -282,8 +379,12 @@ async function handleProxy(req: IncomingMessage, res: ServerResponse, query: URL
   res.statusCode = upstream.status
   upstream.headers.forEach((value, name) => {
     const lower = name.toLowerCase()
-    // fetch 已解压响应体，压缩相关的头不能再透传，长度也交给 chunked
-    if (lower === 'content-encoding' || lower === 'content-length' || lower === 'transfer-encoding' || lower === 'connection') return
+    // fetch 已解压响应体，压缩相关的头不能再透传，长度也交给 chunked；
+    // set-cookie 也不回传，避免上游给本站种 cookie
+    if (
+      lower === 'content-encoding' || lower === 'content-length' || lower === 'transfer-encoding'
+      || lower === 'connection' || lower === 'set-cookie'
+    ) return
     res.setHeader(name, value)
   })
 
