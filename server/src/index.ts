@@ -8,10 +8,13 @@ import {
   countRecords,
   getDatabase,
   getRecord,
+  getSharedConfig,
   hideRecord,
+  listHiddenRecordIds,
   listRecords,
   logAudit,
   registerImage,
+  saveSharedConfig,
   upsertRecord,
 } from './db.js'
 import { extFromMime, isValidImageId, loadImage, normalizeExt, saveImage } from './storage.js'
@@ -220,6 +223,45 @@ async function route(req: IncomingMessage, res: ServerResponse) {
   }
 
   if (path === '/api/records' && method === 'GET') return handleList(res, url.searchParams)
+
+  // 已删除记录 id 列表：各端拉下来后把本地残留一起清掉，做到删除全局生效
+  if (path === '/api/deletions' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, ids: listHiddenRecordIds() })
+  }
+
+  // 全站共享的前端配置（API 配置），改一次所有人生效
+  if (path === '/api/config') {
+    if (method === 'GET') {
+      const row = getSharedConfig()
+      let parsed: unknown = null
+      if (row) {
+        try {
+          parsed = JSON.parse(row.payload_json)
+        } catch {
+          parsed = null
+        }
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        config: parsed,
+        revision: row?.revision ?? 0,
+        updatedAt: row?.updated_at ?? null,
+      })
+    }
+    if (method === 'PUT' || method === 'POST') {
+      const body = await readJson<Record<string, unknown>>(req)
+      if (!Array.isArray(body.profiles)) return fail(res, 400, 'profiles 必须是数组')
+      const payload = {
+        profiles: body.profiles,
+        activeProfileId: str(body.activeProfileId),
+        agentTextProfileId: typeof body.agentTextProfileId === 'string' ? body.agentTextProfileId : null,
+        agentImageProfileId: typeof body.agentImageProfileId === 'string' ? body.agentImageProfileId : null,
+      }
+      const revision = saveSharedConfig(JSON.stringify(payload), Date.now())
+      log(`shared config saved rev=${revision} profiles=${body.profiles.length}`)
+      return sendJson(res, 200, { ok: true, revision })
+    }
+  }
 
   if (path === '/api/records' && method === 'POST') return handleReport(req, res)
 

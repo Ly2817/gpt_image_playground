@@ -24,7 +24,21 @@ import type {
 } from './types'
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_PARAMS } from './types'
 import { DEFAULT_SETTINGS, getActiveApiProfile, getAgentImageApiProfile, getAgentTextApiProfile, getCustomProviderDefinition, mergeImportedSettings, mergePresetImportedSettings, normalizeSettings, resolveApiProfileModel, splitModelList, validateApiProfile } from './lib/apiProfiles'
-import { fetchArchiveRecords, hideArchiveRecord, markTaskReported, markTaskReportedIfNeeded, reportTask, shouldReportTask } from './lib/archiveSync'
+import {
+  fetchArchiveRecords,
+  fetchHiddenRecordIds,
+  fetchSharedConfig,
+  flushPendingHides,
+  hasPendingConfigPush,
+  hideArchiveRecord,
+  markTaskReported,
+  markTaskReportedIfNeeded,
+  notifyRecordsChanged,
+  onRecordsChanged,
+  pushSharedConfig,
+  reportTask,
+  shouldReportTask,
+} from './lib/archiveSync'
 import { enforcePresetConfigPolicy, getPresetConfig, getPresetProfileIds, getPresetProviderIds, isPresetConfigDeletionPrevented, isPresetConfigOnlyEnabled, isPresetConfigParamsLocked, isPresetProfile, isPresetProviderDeletionPrevented } from './lib/presetConfig'
 import { dismissAllTooltips } from './lib/tooltipDismiss'
 import { getTaskPromptText, remapImageMentionsForOrder, replaceImageMentionsForApi, stripImageMentionMarkers } from './lib/promptImageMentions'
@@ -1624,10 +1638,132 @@ async function recoverFalTask(taskId: string) {
   }
 }
 
+// ===== 共享配置与删除同步 =====
+
+/** 应用服务端配置期间抑制回推，避免自激循环 */
+let applyingSharedConfig = false
+/** 与共享配置对齐完成前不允许回推，否则刚打开页面就会用默认值覆盖服务端已有的 API Key */
+let sharedConfigReady = false
+let configDirtyDuringInit = false
+let sharedConfigPushTimer: ReturnType<typeof setTimeout> | null = null
+
+function currentSharedConfig() {
+  const { profiles, activeProfileId, agentTextProfileId, agentImageProfileId } = useStore.getState().settings
+  return { profiles, activeProfileId, agentTextProfileId: agentTextProfileId ?? null, agentImageProfileId: agentImageProfileId ?? null }
+}
+
+function scheduleSharedConfigPush() {
+  if (sharedConfigPushTimer) clearTimeout(sharedConfigPushTimer)
+  sharedConfigPushTimer = setTimeout(() => {
+    sharedConfigPushTimer = null
+    const config = currentSharedConfig()
+    // 一个 Key 都没有的配置不推送，避免把其他人已经配好的共享配置冲掉
+    if (!config.profiles.some((profile) => (profile.apiKey ?? '').trim())) return
+    void pushSharedConfig(config)
+  }, 1200)
+}
+
+/**
+ * 把本地 API 配置推到服务端，让所有人共用一套。
+ * 只监听 profiles / activeProfileId，主题等 UI 偏好仍留在各自浏览器。
+ */
+useStore.subscribe((state, previous) => {
+  if (applyingSharedConfig) return
+  const changed =
+    state.settings.profiles !== previous.settings.profiles ||
+    state.settings.activeProfileId !== previous.settings.activeProfileId
+  if (!changed) return
+  // 初始化阶段（还没跟服务端对齐）先记下，对齐后再补推
+  if (!sharedConfigReady) {
+    configDirtyDuringInit = true
+    return
+  }
+  scheduleSharedConfigPush()
+})
+
+/** 拉取服务端共享 API 配置并应用；本地有未推送成功的改动时以本地为准先补推 */
+async function applySharedConfig() {
+  try {
+    if (hasPendingConfigPush()) {
+      if (await pushSharedConfig(currentSharedConfig())) return
+    }
+    const shared = await fetchSharedConfig()
+    if (!shared?.profiles.length) {
+      // 服务端还没有共享配置：把本机已配好的一份上传，其他人打开即可直接用
+      const local = currentSharedConfig()
+      if (local.profiles.some((profile) => (profile.apiKey ?? '').trim())) {
+        await pushSharedConfig(local)
+      }
+      return
+    }
+    const fallbackId = shared.profiles[0]?.id ?? ''
+    applyingSharedConfig = true
+    try {
+      useStore.getState().setSettings({
+        profiles: shared.profiles,
+        activeProfileId: shared.activeProfileId || fallbackId,
+        agentTextProfileId: shared.agentTextProfileId ?? null,
+        agentImageProfileId: shared.agentImageProfileId ?? null,
+      })
+    } finally {
+      applyingSharedConfig = false
+    }
+  } finally {
+    sharedConfigReady = true
+    if (configDirtyDuringInit) {
+      configDirtyDuringInit = false
+      scheduleSharedConfigPush()
+    }
+  }
+}
+
+/** 把服务端已删除、但本地还留着的任务清掉：删除要在所有界面生效 */
+async function purgeHiddenFromLocal(hiddenIds: Set<string>) {
+  if (!hiddenIds.size) return
+  const stale = useStore.getState().tasks.filter((task) => hiddenIds.has(task.id))
+  if (!stale.length) return
+  const staleIds = new Set(stale.map((task) => task.id))
+  useStore.setState((state) => ({
+    tasks: state.tasks.filter((task) => !staleIds.has(task.id)),
+    selectedTaskIds: state.selectedTaskIds.filter((id) => !staleIds.has(id)),
+  }))
+  await Promise.all(stale.map((task) => dbDeleteTask(task.id)))
+}
+
+let visibilitySyncRegistered = false
+let visibilitySyncing = false
+
+/** 切回页面或其他标签页删除了任务时，同步一次服务端删除列表 */
+function registerArchiveWatchers() {
+  if (visibilitySyncRegistered) return
+  visibilitySyncRegistered = true
+  const sync = async () => {
+    if (visibilitySyncing || document.visibilityState !== 'visible') return
+    visibilitySyncing = true
+    try {
+      await purgeHiddenFromLocal(await fetchHiddenRecordIds())
+    } finally {
+      visibilitySyncing = false
+    }
+  }
+  document.addEventListener('visibilitychange', () => void sync())
+  onRecordsChanged(() => void sync())
+}
+
 /** 初始化：从 IndexedDB 加载任务，按需恢复输入图片，并清理孤立图片 */
 export async function initStore() {
+  // 补发此前未送达的删除请求，再拉服务端删除列表把本地残留清掉，保证删除在所有界面生效
+  await flushPendingHides()
+  const remoteHiddenIds = await fetchHiddenRecordIds()
   const legacyAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
-  const storedTasks = await getAllTasks()
+  let storedTasks = await getAllTasks()
+  if (remoteHiddenIds.size) {
+    const removedByRemote = storedTasks.filter((task) => remoteHiddenIds.has(task.id))
+    if (removedByRemote.length) {
+      storedTasks = storedTasks.filter((task) => !remoteHiddenIds.has(task.id))
+      await Promise.all(removedByRemote.map((task) => dbDeleteTask(task.id)))
+    }
+  }
   const storedAgentConversations = normalizeAgentConversations(await getAllAgentConversations())
   let loadedAgentConversations = mergePersistedAgentConversations(storedAgentConversations, legacyAgentConversations)
   const currentAgentConversations = normalizeAgentConversations(useStore.getState().agentConversations)
@@ -1691,6 +1827,10 @@ export async function initStore() {
     tasks = [...tasks, ...archiveTasks]
     await Promise.all(archiveTasks.map((task) => dbPutTask(getPersistableTask(task))))
   }
+
+  // 应用全站共享的 API 配置（不阻塞启动），并挂上删除同步监听
+  void applySharedConfig()
+  registerArchiveWatchers()
 
   await Promise.all(tasks
     .filter((task, index) => normalizedFavorites.changed || interruptedTaskIds.has(task.id) || task.rawResponsePayload !== markedTasks[index]?.rawResponsePayload)
@@ -4557,6 +4697,8 @@ async function removeTasks(taskIds: string[], updateState?: TaskDeletionStateUpd
   await deleteUnreferencedImageIds(deletedImageIds)
   // 通知服务端：服务端只打隐藏标记，存档记录与图片文件永久保留
   for (const task of deletedTasks) void hideArchiveRecord(task.id)
+  // 同源其他标签页同步刷新，避免一个页面删了另一个页面还留着
+  if (deletedTasks.length) notifyRecordsChanged()
   return deletedTasks.length
 }
 
@@ -4632,6 +4774,7 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
     clearMaskDraft()
     // 服务端同样只打隐藏标记，存档记录与图片文件永久保留
     for (const id of clearedTaskIds) void hideArchiveRecord(id)
+    if (clearedTaskIds.length) notifyRecordsChanged()
   }
 
   if (options.clearConfig) {

@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS audit_log (
   record_id  TEXT,
   detail     TEXT
 );
+
+-- 全站共享的前端设置（目前只存 API 配置：profiles + activeProfileId）
+CREATE TABLE IF NOT EXISTS shared_config (
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  payload_json  TEXT    NOT NULL DEFAULT '{}',
+  revision      INTEGER NOT NULL DEFAULT 1,
+  updated_at    INTEGER NOT NULL
+);
 `
 
 export interface RecordRow {
@@ -245,4 +253,36 @@ export function logAudit(input: { at: number; action: string; recordId: string |
   getDatabase()
     .prepare('INSERT INTO audit_log (at, action, record_id, detail) VALUES (?, ?, ?, ?)')
     .run(input.at, input.action, input.recordId, input.detail)
+}
+
+/** 所有被用户删除过的记录 id，前端据此把本地残留也清掉 */
+export function listHiddenRecordIds(): string[] {
+  const rows = many<{ id: string }>(
+    getDatabase().prepare('SELECT id FROM records WHERE hidden_at IS NOT NULL ORDER BY hidden_at DESC').all(),
+  )
+  return rows.map((row) => row.id)
+}
+
+export interface SharedConfigRow {
+  payload_json: string
+  revision: number
+  updated_at: number
+}
+
+export function getSharedConfig(): SharedConfigRow | undefined {
+  return one<SharedConfigRow>(getDatabase().prepare('SELECT * FROM shared_config WHERE id = 1').get())
+}
+
+export function saveSharedConfig(payloadJson: string, now: number): number {
+  const db = getDatabase()
+  db.prepare(
+    `INSERT INTO shared_config (id, payload_json, revision, updated_at)
+     VALUES (1, ?, 1, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       payload_json = excluded.payload_json,
+       revision     = shared_config.revision + 1,
+       updated_at   = excluded.updated_at`,
+  ).run(payloadJson, now)
+  const row = getSharedConfig()
+  return row?.revision ?? 1
 }
