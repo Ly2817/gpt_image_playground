@@ -1,14 +1,16 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { mkdirSync } from 'node:fs'
-import { config, paths } from './config.js'
+import { config, paths, SERVER_MANAGED_KEY } from './config.js'
 import { basicAuthEnabled, configureBasicAuth, isAuthorized } from './auth.js'
 import {
   appendRevision,
   closeDatabase,
   countRecords,
+  findSharedProfile,
   getDatabase,
   getRecord,
   getSharedConfig,
+  getSharedProfiles,
   hideRecord,
   listHiddenRecordIds,
   listRecords,
@@ -192,6 +194,121 @@ function notFound(res: ServerResponse, message = '资源不存在') {
   res.end(payload)
 }
 
+/** 下发给前端时抹掉真实 Key，只留占位符，前端各处「是否已配置 Key」的校验依然能通过 */
+function sanitizeConfig(parsed: unknown): unknown {
+  if (!parsed || typeof parsed !== 'object') return parsed
+  const source = parsed as { profiles?: unknown }
+  if (!Array.isArray(source.profiles)) return parsed
+  return {
+    ...source,
+    profiles: source.profiles.map((profile) => {
+      if (!profile || typeof profile !== 'object') return profile
+      const item = profile as Record<string, unknown>
+      const hasKey = typeof item.apiKey === 'string' && item.apiKey.trim().length > 0
+      return { ...item, apiKey: hasKey ? SERVER_MANAGED_KEY : '' }
+    }),
+  }
+}
+
+/** 前端回推时 Key 是占位符或空，按 profile id 沿用服务端已存的真实 Key */
+function mergeProfilesWithStoredKey(incoming: unknown[]): unknown[] {
+  const stored = new Map(getSharedProfiles().map((profile) => [profile.id, profile]))
+  return incoming.map((profile) => {
+    if (!profile || typeof profile !== 'object') return profile
+    const item = profile as Record<string, unknown>
+    const key = typeof item.apiKey === 'string' ? item.apiKey : ''
+    if (key && key !== SERVER_MANAGED_KEY) return item
+    const id = typeof item.id === 'string' ? item.id : ''
+    return { ...item, apiKey: stored.get(id)?.apiKey ?? '' }
+  })
+}
+
+/**
+ * AI 请求代理：浏览器不再持有真实 Key。
+ * 收到的请求按 profileId 找到服务端存的 Key 注入后再转发，响应（含流式）原样透传。
+ */
+async function handleProxy(req: IncomingMessage, res: ServerResponse, query: URLSearchParams) {
+  const profileId = query.get('profile') ?? ''
+  const target = query.get('target') ?? ''
+  if (!target) return fail(res, 400, '缺少 target 参数')
+
+  let targetUrl: URL
+  try {
+    targetUrl = new URL(target)
+  } catch {
+    return fail(res, 400, 'target 不是合法 URL')
+  }
+  if (targetUrl.protocol !== 'http:' && targetUrl.protocol !== 'https:') {
+    return fail(res, 400, 'target 只支持 http/https')
+  }
+
+  const profile = findSharedProfile(profileId)
+  if (!profile) return fail(res, 404, '找不到对应的 API 配置')
+  const realKey = (profile.apiKey ?? '').trim()
+  if (!realKey) return fail(res, 400, '该配置没有可用的 API Key')
+
+  const method = req.method ?? 'POST'
+  const hasBody = method !== 'GET' && method !== 'HEAD'
+  const body = hasBody ? await readBody(req, config.maxProxyBodyBytes) : undefined
+
+  const headers: Record<string, string> = {}
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (!value) continue
+    const lower = name.toLowerCase()
+    // 长度由 fetch 重算；accept-encoding 交给 fetch 自己协商
+    if (lower === 'host' || lower === 'content-length' || lower === 'connection' || lower === 'accept-encoding') continue
+    headers[lower] = Array.isArray(value) ? value.join(', ') : String(value)
+  }
+  headers.authorization = profile.provider === 'fal' ? `Key ${realKey}` : `Bearer ${realKey}`
+
+  const controller = new AbortController()
+  res.on('close', () => {
+    if (!res.writableEnded) controller.abort()
+  })
+
+  const startedAt = Date.now()
+  let upstream: Response
+  try {
+    upstream = await fetch(targetUrl, { method, headers, body, signal: controller.signal })
+  } catch (error) {
+    if (controller.signal.aborted) return
+    const message = error instanceof Error ? error.message : String(error)
+    log(`proxy ${method} ${targetUrl.pathname} -> 502 ${message}`)
+    return fail(res, 502, `转发失败：${message}`)
+  }
+
+  log(`proxy ${method} ${targetUrl.host}${targetUrl.pathname} -> ${upstream.status} (${Date.now() - startedAt}ms)`)
+
+  res.statusCode = upstream.status
+  upstream.headers.forEach((value, name) => {
+    const lower = name.toLowerCase()
+    // fetch 已解压响应体，压缩相关的头不能再透传，长度也交给 chunked
+    if (lower === 'content-encoding' || lower === 'content-length' || lower === 'transfer-encoding' || lower === 'connection') return
+    res.setHeader(name, value)
+  })
+
+  if (!upstream.body) {
+    res.end()
+    return
+  }
+
+  // 手动搬运以便处理背压，流式响应可以边收边发
+  const reader = upstream.body.getReader()
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!res.write(Buffer.from(value))) {
+        await new Promise<void>((resolve) => res.once('drain', resolve))
+      }
+    }
+  } catch {
+    // 客户端断开或上游断流，直接收尾
+  } finally {
+    res.end()
+  }
+}
+
 async function route(req: IncomingMessage, res: ServerResponse) {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
   const path = url.pathname
@@ -243,7 +360,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       }
       return sendJson(res, 200, {
         ok: true,
-        config: parsed,
+        config: sanitizeConfig(parsed),
         revision: row?.revision ?? 0,
         updatedAt: row?.updated_at ?? null,
       })
@@ -252,7 +369,7 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       const body = await readJson<Record<string, unknown>>(req)
       if (!Array.isArray(body.profiles)) return fail(res, 400, 'profiles 必须是数组')
       const payload = {
-        profiles: body.profiles,
+        profiles: mergeProfilesWithStoredKey(body.profiles),
         activeProfileId: str(body.activeProfileId),
         agentTextProfileId: typeof body.agentTextProfileId === 'string' ? body.agentTextProfileId : null,
         agentImageProfileId: typeof body.agentImageProfileId === 'string' ? body.agentImageProfileId : null,
@@ -262,6 +379,8 @@ async function route(req: IncomingMessage, res: ServerResponse) {
       return sendJson(res, 200, { ok: true, revision })
     }
   }
+
+  if (path === '/api/proxy') return handleProxy(req, res, url.searchParams)
 
   if (path === '/api/records' && method === 'POST') return handleReport(req, res)
 

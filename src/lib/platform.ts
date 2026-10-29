@@ -1,7 +1,45 @@
 import { invoke, isTauri as detectTauri } from '@tauri-apps/api/core'
 import { openUrl } from '@tauri-apps/plugin-opener'
+import { archiveApiUrl } from './archiveBase'
 
 export const isTauri = detectTauri()
+
+export interface ApiProxyTarget {
+  profileId: string
+  url: string
+}
+
+/**
+ * 由 store 注册：把外部 API 地址解析成本站代理请求；返回 null 表示该请求不代理。
+ * platform 是底层模块，不直接依赖 store，避免循环引用。
+ */
+let apiProxyResolver: ((url: string) => ApiProxyTarget | null) | null = null
+
+export function setApiProxyResolver(resolver: ((url: string) => ApiProxyTarget | null) | null) {
+  apiProxyResolver = resolver
+}
+
+function buildProxyUrl(target: ApiProxyTarget): string {
+  const url = new URL(archiveApiUrl('api/proxy'))
+  url.searchParams.set('profile', target.profileId)
+  url.searchParams.set('target', target.url)
+  return url.toString()
+}
+
+/**
+ * 命中代理规则时改写成同源请求。
+ * 必须去掉 Authorization：真实 Key 由服务端注入，前端这个头会覆盖浏览器自动附加的 Basic 认证。
+ */
+function rewriteAsProxy(input: string | URL, init: RequestInit): { url: string; init: RequestInit } | null {
+  if (!apiProxyResolver) return null
+  const raw = String(input)
+  if (!/^https?:\/\//i.test(raw)) return null
+  const target = apiProxyResolver(raw)
+  if (!target) return null
+  const headers = new Headers(init.headers)
+  headers.delete('authorization')
+  return { url: buildProxyUrl(target), init: { ...init, headers } }
+}
 
 /** 客户端自绘标题栏的高度（src/components/TitleBar.tsx），页面经 `--safe-area-top` 让出；网页版为 0 */
 export const TITLEBAR_HEIGHT = isTauri ? 32 : 0
@@ -30,7 +68,11 @@ const abandonedBodies = isTauri ? new FinalizationRegistry<string>(cancelRequest
  */
 export async function apiFetch(input: string | URL, init: RequestInit = {}): Promise<Response> {
   // data:、blob: 和相对地址继续走原生 fetch；每次调用时读取 globalThis.fetch，测试会替换它
-  if (!isTauri || !/^https?:\/\//i.test(String(input))) return globalThis.fetch(input, init)
+  if (!isTauri || !/^https?:\/\//i.test(String(input))) {
+    const proxied = rewriteAsProxy(input, init)
+    if (proxied) return globalThis.fetch(proxied.url, proxied.init)
+    return globalThis.fetch(input, init)
+  }
 
   const signal = init.signal
   // 借 Request 把字符串、FormData、Blob 等请求体统一成字节，FormData 的 multipart 边界也会写进 Content-Type

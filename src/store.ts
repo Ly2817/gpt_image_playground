@@ -89,7 +89,7 @@ import { ALL_FAVORITES_COLLECTION_ID, DEFAULT_FAVORITE_COLLECTION_ID, createDefa
 import { createPersistedState, mergePersistedAgentConversations, migratePersistedState, normalizePersistedState } from './lib/persistedState'
 import { addImageSizeParam, createTaskDonePatch, createTaskErrorPatch, deriveAgentImageActualParams, deriveGalleryActualParams, firstActualParams, hasActualParams, hasActualSizeParam, mapActualParamsByImage, mapRevisedPromptsByImage, markInterruptedOpenAIRunningTasks } from './lib/taskState'
 import { stripInjectedCodexCliSizePrompt } from './lib/size'
-import { apiFetch, FetchConnectError, isTauri } from './lib/platform'
+import { apiFetch, FetchConnectError, isTauri, setApiProxyResolver } from './lib/platform'
 import { pickSaveDir, saveFile, saveFileToDir, type SaveOptions } from './lib/saveFile'
 import { endDataProgress, setDataProgressCancelable, startDataProgress, updateDataProgress, useSettingsDataTransfer } from './lib/dataProgress'
 import { throwIfAborted } from './lib/serverSentEvents'
@@ -1640,6 +1640,26 @@ async function recoverFalTask(taskId: string) {
 
 // ===== 共享配置与删除同步 =====
 
+/**
+ * 把指向 AI 接口的请求改写成同源代理：真实 API Key 只存在服务器上，
+ * 浏览器这边拿到的只是占位符，由服务端在转发时替换。
+ */
+setApiProxyResolver((url) => {
+  const { profiles } = useStore.getState().settings
+  // fal.ai 走队列域名，与配置里的 baseUrl 无关
+  if (/^https:\/\/(queue\.)?fal\.(run|ai)\//i.test(url)) {
+    const falProfile = profiles.find((profile) => profile.provider === 'fal')
+    return falProfile ? { profileId: falProfile.id, url } : null
+  }
+  for (const profile of profiles) {
+    if (profile.provider === 'fal') continue
+    const base = (profile.baseUrl ?? '').trim().replace(/\/+$/, '')
+    if (!base) continue
+    if (url === base || url.startsWith(`${base}/`)) return { profileId: profile.id, url }
+  }
+  return null
+})
+
 /** 应用服务端配置期间抑制回推，避免自激循环 */
 let applyingSharedConfig = false
 /** 与共享配置对齐完成前不允许回推，否则刚打开页面就会用默认值覆盖服务端已有的 API Key */
@@ -1683,16 +1703,20 @@ useStore.subscribe((state, previous) => {
 
 /** 拉取服务端共享 API 配置并应用；本地有未推送成功的改动时以本地为准先补推 */
 async function applySharedConfig() {
+  let syncedWithServer = false
   try {
     if (hasPendingConfigPush()) {
-      if (await pushSharedConfig(currentSharedConfig())) return
+      if (await pushSharedConfig(currentSharedConfig())) {
+        syncedWithServer = true
+        return
+      }
     }
     const shared = await fetchSharedConfig()
     if (!shared?.profiles.length) {
       // 服务端还没有共享配置：把本机已配好的一份上传，其他人打开即可直接用
       const local = currentSharedConfig()
       if (local.profiles.some((profile) => (profile.apiKey ?? '').trim())) {
-        await pushSharedConfig(local)
+        if (await pushSharedConfig(local)) syncedWithServer = true
       }
       return
     }
@@ -1708,8 +1732,11 @@ async function applySharedConfig() {
     } finally {
       applyingSharedConfig = false
     }
+    syncedWithServer = true
   } finally {
     sharedConfigReady = true
+    // 已经和服务端一致时，初始化期间的 profiles 变化只是本地归一化，不必再回推
+    if (syncedWithServer) configDirtyDuringInit = false
     if (configDirtyDuringInit) {
       configDirtyDuringInit = false
       scheduleSharedConfigPush()

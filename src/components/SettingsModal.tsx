@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react
 import { createPortal } from 'react-dom'
 import { readText } from '@tauri-apps/plugin-clipboard-manager'
 import { normalizeBaseUrl } from '../lib/api'
+import { SERVER_MANAGED_API_KEY } from '../lib/archiveBase'
 import { customProviderSupportsNativeTransparentBackground } from '../lib/customProviderCapabilities'
 import { hasActiveDataOperations, trackDataTransfer } from '../lib/dataOperations'
 import { useSettingsDataTransfer } from '../lib/dataProgress'
@@ -1510,11 +1511,13 @@ export default function SettingsModal() {
                 <span className="mb-1.5 block text-sm text-gray-600 dark:text-gray-300">API Key</span>
                 <div className="relative">
                   <input
-                    value={activeProfile.apiKey}
+                    value={activeProfile.apiKey === SERVER_MANAGED_API_KEY ? '' : activeProfile.apiKey}
                     onChange={(e) => updateActiveProfile({ apiKey: e.target.value })}
                     onBlur={(e) => commitActiveProfilePatch({ apiKey: e.target.value })}
                     type={showApiKey ? 'text' : 'password'}
-                    placeholder={activeProfile.provider === 'fal' ? 'FAL_KEY' : 'sk-...'}
+                    placeholder={activeProfile.apiKey === SERVER_MANAGED_API_KEY
+                      ? '已由服务器托管，留空即可'
+                      : (activeProfile.provider === 'fal' ? 'FAL_KEY' : 'sk-...')}
                     className="w-full rounded-xl border border-transparent bg-black/[0.04] px-3 py-2.5 pr-10 text-sm text-gray-700 outline-none transition focus:border-blue-300 dark:bg-white/[0.06] dark:text-gray-200 dark:focus:border-blue-500/50"
                   />
                   <button
@@ -1539,7 +1542,9 @@ export default function SettingsModal() {
                   </button>
                 </div>
                 <div data-selectable-text className="mt-1.5 text-xs text-gray-500 dark:text-gray-500">
-                  支持通过链接参数导入：<code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">?apiKey=</code>
+                  {activeProfile.apiKey === SERVER_MANAGED_API_KEY
+                    ? 'Key 保存在服务器上，这里留空即可；如果要换 Key，直接填入新的即可覆盖。'
+                    : <>支持通过链接参数导入：<code className="bg-gray-100 dark:bg-white/[0.06] px-1 py-0.5 rounded">?apiKey=</code></>}
                 </div>
               </div>
 

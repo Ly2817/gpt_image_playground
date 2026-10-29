@@ -286,3 +286,29 @@ export function saveSharedConfig(payloadJson: string, now: number): number {
   const row = getSharedConfig()
   return row?.revision ?? 1
 }
+
+export interface StoredProfile {
+  id: string
+  provider?: string
+  baseUrl?: string
+  apiKey?: string
+}
+
+/** 取共享配置里的完整 profile（含真实 Key），仅供服务端代理使用 */
+export function getSharedProfiles(): StoredProfile[] {
+  const row = getSharedConfig()
+  if (!row) return []
+  try {
+    const parsed = JSON.parse(row.payload_json) as { profiles?: unknown }
+    if (!Array.isArray(parsed.profiles)) return []
+    return parsed.profiles.filter((item): item is StoredProfile => {
+      return Boolean(item) && typeof item === 'object' && typeof (item as StoredProfile).id === 'string'
+    })
+  } catch {
+    return []
+  }
+}
+
+export function findSharedProfile(profileId: string): StoredProfile | undefined {
+  return getSharedProfiles().find((profile) => profile.id === profileId)
+}
