@@ -1,5 +1,8 @@
 #!/bin/sh
 
+# 静态产物目录：nginx 镜像为 /usr/share/nginx/html，Node 运行时通过 STATIC_DIR 指定
+STATIC_DIR="${STATIC_DIR:-/usr/share/nginx/html}"
+
 # 用环境变量替换前端默认 API URL。显式传入空字符串时保留为空。
 if [ "${DEFAULT_API_URL+x}" != "x" ]; then
     DEFAULT_API_URL=${API_URL:-https://api.openai.com/v1}
@@ -87,22 +90,16 @@ DEFAULT_MONO_FONT_ESCAPED=$(escape_sed_replacement "$(escape_js_string "$DEFAULT
 BUILTIN_FONT_SOURCE_ESCAPED=$(escape_sed_replacement "$(escape_js_string "$BUILTIN_FONT_SOURCE")")
 
 # 查找所有 js 文件并将占位符替换为运行时配置
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_DEFAULT_API_URL_PLACEHOLDER__|$DEFAULT_API_URL_ESCAPED|g" {} +
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_API_PROXY_AVAILABLE_PLACEHOLDER__|$API_PROXY_AVAILABLE|g" {} +
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_API_PROXY_LOCKED_PLACEHOLDER__|$API_PROXY_LOCKED|g" {} +
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_DOCKER_DEPLOYMENT_PLACEHOLDER__|true|g" {} +
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_DOCKER_LEGACY_API_URL_USED_PLACEHOLDER__|$DOCKER_LEGACY_API_URL_USED|g" {} +
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_SHOW_PRESET_CONFIG_ONLY_PLACEHOLDER__|$PRESET_CONFIG_ONLY|g" {} +
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_LOCK_PRESET_CONFIG_PARAMS_PLACEHOLDER__|$PRESET_CONFIG_PARAMS_LOCKED|g" {} +
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_PREVENT_PRESET_CONFIG_DELETION_PLACEHOLDER__|$PRESET_CONFIG_DELETION_PREVENTED|g" {} +
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_DEFAULT_UI_FONT_PLACEHOLDER__|$DEFAULT_UI_FONT_ESCAPED|g" {} +
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_DEFAULT_MONO_FONT_PLACEHOLDER__|$DEFAULT_MONO_FONT_ESCAPED|g" {} +
-find /usr/share/nginx/html/assets -type f -name "*.js" -exec sed -i "s|__VITE_BUILTIN_FONT_SOURCE_PLACEHOLDER__|$BUILTIN_FONT_SOURCE_ESCAPED|g" {} +
-
-# 检查是否启用了 API 代理
-if [ "$ENABLE_API_PROXY" != "true" ]; then
-    # 删除代理配置块
-    sed -i '/# BEGIN API PROXY/,/# END API PROXY/d' /etc/nginx/conf.d/default.conf
-fi
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_DEFAULT_API_URL_PLACEHOLDER__|$DEFAULT_API_URL_ESCAPED|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_API_PROXY_AVAILABLE_PLACEHOLDER__|$API_PROXY_AVAILABLE|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_API_PROXY_LOCKED_PLACEHOLDER__|$API_PROXY_LOCKED|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_DOCKER_DEPLOYMENT_PLACEHOLDER__|true|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_DOCKER_LEGACY_API_URL_USED_PLACEHOLDER__|$DOCKER_LEGACY_API_URL_USED|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_SHOW_PRESET_CONFIG_ONLY_PLACEHOLDER__|$PRESET_CONFIG_ONLY|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_LOCK_PRESET_CONFIG_PARAMS_PLACEHOLDER__|$PRESET_CONFIG_PARAMS_LOCKED|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_PREVENT_PRESET_CONFIG_DELETION_PLACEHOLDER__|$PRESET_CONFIG_DELETION_PREVENTED|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_DEFAULT_UI_FONT_PLACEHOLDER__|$DEFAULT_UI_FONT_ESCAPED|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_DEFAULT_MONO_FONT_PLACEHOLDER__|$DEFAULT_MONO_FONT_ESCAPED|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_BUILTIN_FONT_SOURCE_PLACEHOLDER__|$BUILTIN_FONT_SOURCE_ESCAPED|g" {} +
 
 exec "$@"

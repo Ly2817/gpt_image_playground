@@ -1,4 +1,5 @@
 import type { AgentConversation, TaskRecord, StoredImage, StoredImageThumbnail } from '../types'
+import { getArchivedImageRecord } from './archiveImageSource'
 import { dbTransaction, openDB, STORE_AGENT_CONVERSATIONS, STORE_IMAGES, STORE_TASKS, STORE_THUMBNAILS } from './idb'
 import { disableBlobStorage, fromImageRecord, fromThumbnailRecord, getStoredImageRecord, getStoredThumbnailRecord, toImageRecord, toThumbnailRecord, type StoredImageRecord } from './imageBlob'
 
@@ -82,8 +83,11 @@ export function replaceAgentConversations(conversations: AgentConversation[]): P
 
 // ===== Images =====
 
-export function getImage(id: string): Promise<StoredImage | undefined> {
-  return getStoredImageRecord(id).then(fromImageRecord)
+export async function getImage(id: string): Promise<StoredImage | undefined> {
+  const local = await getStoredImageRecord(id)
+  // 本地没有时从服务端存档回源，让换设备登录后也能看到历史图片
+  const record = local ?? (await getArchivedImageRecord(id))
+  return fromImageRecord(record)
 }
 
 /** 只取元数据（宽高等），不读出图片内容 */

@@ -24,6 +24,7 @@ import type {
 } from './types'
 import { DEFAULT_AGENT_MAX_TOOL_ROUNDS, DEFAULT_PARAMS } from './types'
 import { DEFAULT_SETTINGS, getActiveApiProfile, getAgentImageApiProfile, getAgentTextApiProfile, getCustomProviderDefinition, mergeImportedSettings, mergePresetImportedSettings, normalizeSettings, resolveApiProfileModel, splitModelList, validateApiProfile } from './lib/apiProfiles'
+import { fetchArchiveRecords, hideArchiveRecord, markTaskReported, markTaskReportedIfNeeded, reportTask, shouldReportTask } from './lib/archiveSync'
 import { enforcePresetConfigPolicy, getPresetConfig, getPresetProfileIds, getPresetProviderIds, isPresetConfigDeletionPrevented, isPresetConfigOnlyEnabled, isPresetConfigParamsLocked, isPresetProfile, isPresetProviderDeletionPrevented } from './lib/presetConfig'
 import { dismissAllTooltips } from './lib/tooltipDismiss'
 import { getTaskPromptText, remapImageMentionsForOrder, replaceImageMentionsForApi, stripImageMentionMarkers } from './lib/promptImageMentions'
@@ -1215,8 +1216,28 @@ function getPersistableTask(task: TaskRecord): TaskRecord {
   return rawResponsePayload === task.rawResponsePayload ? task : { ...task, rawResponsePayload }
 }
 
+const archiveReportTimers = new Map<string, ReturnType<typeof setTimeout>>()
+
+/** 任务进入终结态后把快照推到服务端存档；合并 800ms 内的连续写入，网络异常一律忽略 */
+function scheduleArchiveReport(task: TaskRecord) {
+  if (!shouldReportTask(task)) return
+  const existing = archiveReportTimers.get(task.id)
+  if (existing) clearTimeout(existing)
+  archiveReportTimers.set(
+    task.id,
+    setTimeout(() => {
+      archiveReportTimers.delete(task.id)
+      void reportTask(task).then((ok) => {
+        if (ok) markTaskReportedIfNeeded(task)
+      })
+    }, 800),
+  )
+}
+
 function putTask(task: TaskRecord): Promise<IDBValidKey> {
-  return dbPutTask(getPersistableTask(task))
+  const persistable = getPersistableTask(task)
+  scheduleArchiveReport(persistable)
+  return dbPutTask(persistable)
 }
 
 export function getCodexCliPromptKey(settings: AppSettings): string {
@@ -1645,13 +1666,32 @@ export async function initStore() {
   const interruptedTaskIds = new Set(interruptedTasks.map((task) => task.id))
   const favoriteState = useStore.getState()
   const normalizedFavorites = normalizeLoadedFavoriteState(markedTasks.map(getPersistableTask), favoriteState.favoriteCollections, favoriteState.defaultFavoriteCollectionId)
-  const tasks = normalizedFavorites.tasks
+  let tasks = normalizedFavorites.tasks
   if (normalizedFavorites.collections !== favoriteState.favoriteCollections) {
     favoriteState.setFavoriteCollections(normalizedFavorites.collections)
   }
   if (normalizedFavorites.defaultFavoriteCollectionId !== favoriteState.defaultFavoriteCollectionId) {
     useStore.getState().setDefaultFavoriteCollectionId(normalizedFavorites.defaultFavoriteCollectionId)
   }
+  // 合并服务端存档中的历史：本地没有的任务补写进 IndexedDB，换浏览器/换设备后依然可见。
+  // 追加在数组末尾，保证上面按索引对齐 markedTasks 的判断不受影响。
+  const archiveRecords = await fetchArchiveRecords()
+  const knownTaskIds = new Set(tasks.map((task) => task.id))
+  const archiveTasks: TaskRecord[] = []
+  for (const record of archiveRecords) {
+    const task = record?.task
+    if (!task || typeof task.id !== 'string' || knownTaskIds.has(task.id)) continue
+    if (!Array.isArray(task.outputImages) || !Array.isArray(task.inputImageIds)) continue
+    // 标记为已上报，避免刚拉下来的历史又被回传到服务端
+    markTaskReported(task)
+    knownTaskIds.add(task.id)
+    archiveTasks.push(task)
+  }
+  if (archiveTasks.length) {
+    tasks = [...tasks, ...archiveTasks]
+    await Promise.all(archiveTasks.map((task) => dbPutTask(getPersistableTask(task))))
+  }
+
   await Promise.all(tasks
     .filter((task, index) => normalizedFavorites.changed || interruptedTaskIds.has(task.id) || task.rawResponsePayload !== markedTasks[index]?.rawResponsePayload)
     .map((task) => putTask(task)))
@@ -4515,6 +4555,8 @@ async function removeTasks(taskIds: string[], updateState?: TaskDeletionStateUpd
     updatedConversations: [...updatedConversations.values()],
   })
   await deleteUnreferencedImageIds(deletedImageIds)
+  // 通知服务端：服务端只打隐藏标记，存档记录与图片文件永久保留
+  for (const task of deletedTasks) void hideArchiveRecord(task.id)
   return deletedTasks.length
 }
 
@@ -4573,6 +4615,7 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
   if (useStore.getState().batchProgress) endBatch(activeBatchId)
 
   if (options.clearTasks) {
+    const clearedTaskIds = useStore.getState().tasks.map((task) => task.id)
     await dbClearTasks()
     await dbClearAgentConversations()
     await clearImages()
@@ -4587,6 +4630,8 @@ export async function clearData(options: ClearOptions = { clearConfig: true, cle
     })
     clearInputImages()
     clearMaskDraft()
+    // 服务端同样只打隐藏标记，存档记录与图片文件永久保留
+    for (const id of clearedTaskIds) void hideArchiveRecord(id)
   }
 
   if (options.clearConfig) {

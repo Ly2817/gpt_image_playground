@@ -5,3 +5,5 @@ dist
 *.md
 Dockerfile
 .dockerignore
+server/node_modules
+server/dist

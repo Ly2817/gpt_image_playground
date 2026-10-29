@@ -1,0 +1,60 @@
+# ============ 阶段一：前端构建 ============
+FROM --platform=$BUILDPLATFORM node:24-alpine AS build
+
+WORKDIR /app
+
+ENV VITE_DEFAULT_API_URL=__VITE_DEFAULT_API_URL_PLACEHOLDER__
+ENV VITE_API_PROXY_AVAILABLE=__VITE_API_PROXY_AVAILABLE_PLACEHOLDER__
+ENV VITE_API_PROXY_LOCKED=__VITE_API_PROXY_LOCKED_PLACEHOLDER__
+ENV VITE_DOCKER_DEPLOYMENT=__VITE_DOCKER_DEPLOYMENT_PLACEHOLDER__
+ENV VITE_DOCKER_LEGACY_API_URL_USED=__VITE_DOCKER_LEGACY_API_URL_USED_PLACEHOLDER__
+ENV VITE_SHOW_PRESET_CONFIG_ONLY=__VITE_SHOW_PRESET_CONFIG_ONLY_PLACEHOLDER__
+ENV VITE_LOCK_PRESET_CONFIG_PARAMS=__VITE_LOCK_PRESET_CONFIG_PARAMS_PLACEHOLDER__
+ENV VITE_PREVENT_PRESET_CONFIG_DELETION=__VITE_PREVENT_PRESET_CONFIG_DELETION_PLACEHOLDER__
+ENV VITE_DEFAULT_UI_FONT=__VITE_DEFAULT_UI_FONT_PLACEHOLDER__
+ENV VITE_DEFAULT_MONO_FONT=__VITE_DEFAULT_MONO_FONT_PLACEHOLDER__
+ENV VITE_BUILTIN_FONT_SOURCE=__VITE_BUILTIN_FONT_SOURCE_PLACEHOLDER__
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+# ============ 阶段二：存档服务构建 ============
+FROM node:24-alpine AS server-build
+
+WORKDIR /srv
+
+COPY server/package.json ./
+RUN npm install --no-audit --no-fund
+
+COPY server/tsconfig.json ./
+COPY server/src ./src
+RUN npm run build
+
+# ============ 阶段三：运行时 ============
+FROM node:24-alpine
+
+WORKDIR /app
+
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=3000 \
+    STATIC_DIR=/app/dist \
+    DATA_DIR=/data \
+    DEFAULT_API_URL= \
+    API_PROXY_URL=
+
+COPY --from=build /app/dist ./dist
+COPY --from=server-build /srv/dist ./server-dist
+COPY deploy/inject-api-url.sh /opt/inject-api-url.sh
+COPY deploy/migrate-api-env.envsh /opt/migrate-api-env.envsh
+RUN chmod +x /opt/inject-api-url.sh /opt/migrate-api-env.envsh
+
+# 存档数据卷：SQLite 库与图片都落在这里，容器重建不丢数据
+VOLUME ["/data"]
+
+EXPOSE 3000
+
+ENTRYPOINT ["/bin/sh", "-c", ". /opt/migrate-api-env.envsh && /opt/inject-api-url.sh node server-dist/index.js"]
