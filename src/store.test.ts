@@ -1,13 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { strToU8, zipSync } from 'fflate'
 import { DEFAULT_PARAMS } from './types'
-import { createDefaultFalProfile, createDefaultOpenAIProfile, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, normalizeSettings } from './lib/apiProfiles'
+import { createDefaultFalProfile, createDefaultOpenAIProfile, DEFAULT_IMAGES_MODEL, DEFAULT_RESPONSES_MODEL, DEFAULT_SETTINGS, normalizeSettings } from './lib/apiProfiles'
 import type { AgentConversation, ExportData, StoredImage, StoredImageThumbnail, TaskRecord } from './types'
 import { getSelectedImageMentionLabel } from './lib/promptImageMentions'
 import { hasActiveDataOperations, hasInterruptibleOperations, trackDataTransfer } from './lib/dataOperations'
 import { cancelDataProgress, useDataProgress } from './lib/dataProgress'
 import { deleteAgentRoundFromConversation, getActiveAgentRounds, getAgentConversationTaskIds, getAgentRoundTaskIds, remapAgentRoundMentionsForPathChange } from './lib/agentConversationState'
 import { cleanStaleAgentInputDrafts } from './lib/inputDraftState'
+import { ALL_FAVORITES_COLLECTION_ID } from './lib/favoriteState'
 import { normalizePersistedState } from './lib/persistedState'
 import { setPresetConfig } from './lib/presetConfig'
 import { FetchConnectError } from './lib/platform'
@@ -329,7 +330,107 @@ describe('task retry', () => {
       tasks: [],
       showToast: vi.fn(),
       detailTaskId: null,
+      filterFavorite: false,
+      activeFavoriteCollectionId: null,
     })
+  })
+
+  it('persists prompt hints and clears them when retrying without hints', async () => {
+    const hints = { prefix: '生成图像：', suffix: '请使用 google:search 搜索相关信息。' }
+    useStore.setState({ appMode: 'gallery', prompt: 'example', inputImages: [], params: { ...DEFAULT_PARAMS } })
+    vi.mocked(callImageApi).mockImplementationOnce(async (opts) => {
+      opts.onPromptHintsPrepared?.(hints)
+      throw new Error('example failure')
+    })
+    await submitTask()
+    await vi.waitFor(() => expect(useStore.getState().tasks[0]?.status).toBe('error'))
+    expect((await getAllTasks())[0].promptHints).toEqual(hints)
+    useStore.setState({ settings: { ...useStore.getState().settings, imagePromptHints: false } })
+    expect(useStore.getState().tasks[0].promptHints).toEqual(hints)
+    vi.mocked(callImageApi).mockImplementationOnce(async (opts) => {
+      opts.onPromptHintsPrepared?.(undefined)
+      return { images: [] }
+    })
+    await retryTask(useStore.getState().tasks[0])
+    await vi.waitFor(() => expect(useStore.getState().tasks[0]?.status).not.toBe('running'))
+    expect((await getAllTasks())[0].promptHints).toBeUndefined()
+  })
+
+  it('adds a new task created on a favorites page to the active collection', async () => {
+    const collection = { id: 'collection-a', name: '收藏夹 A', createdAt: 1, updatedAt: 1 }
+    const failed = task({ status: 'error', error: '上次失败' })
+    useStore.setState({
+      appMode: 'gallery',
+      filterFavorite: true,
+      activeFavoriteCollectionId: collection.id,
+      favoriteCollections: [collection],
+      defaultFavoriteCollectionId: collection.id,
+      settings: { ...useStore.getState().settings, retryMode: 'new' },
+      tasks: [failed],
+      prompt: 'prompt',
+      inputImages: [],
+      params: { ...DEFAULT_PARAMS },
+    })
+    vi.mocked(callImageApi).mockResolvedValue({ images: [], actualParams: {}, actualParamsList: [], revisedPrompts: [] })
+
+    await retryTask(failed)
+    expect(useStore.getState().tasks[0]).toMatchObject({ favoriteCollectionIds: [collection.id], isFavorite: true })
+    await submitTask()
+    expect(useStore.getState().tasks[0]).toMatchObject({ favoriteCollectionIds: [collection.id], isFavorite: true })
+
+    useStore.setState({ settings: { ...useStore.getState().settings, saveTasksToActiveFavoriteCollection: false } })
+    await submitTask()
+    expect(useStore.getState().tasks[0].isFavorite).toBeUndefined()
+    await vi.waitFor(() => expect(useStore.getState().tasks.every((item) => item.status !== 'running')).toBe(true))
+  })
+
+  it('keeps the source collections when retrying on the all favorites page', async () => {
+    const collectionA = { id: 'collection-a', name: '收藏夹 A', createdAt: 1, updatedAt: 1 }
+    const collectionB = { id: 'collection-b', name: '收藏夹 B', createdAt: 1, updatedAt: 1 }
+    const failed = task({ status: 'error', error: '上次失败', favoriteCollectionIds: [collectionB.id], isFavorite: true })
+    useStore.setState({
+      appMode: 'gallery',
+      filterFavorite: true,
+      activeFavoriteCollectionId: ALL_FAVORITES_COLLECTION_ID,
+      favoriteCollections: [collectionA, collectionB],
+      defaultFavoriteCollectionId: collectionA.id,
+      settings: { ...useStore.getState().settings, retryMode: 'new' },
+      tasks: [failed],
+    })
+    vi.mocked(callImageApi).mockResolvedValue({ images: [], actualParams: {}, actualParamsList: [], revisedPrompts: [] })
+
+    await retryTask(failed)
+    expect(useStore.getState().tasks[0]).toMatchObject({ favoriteCollectionIds: [collectionB.id], isFavorite: true })
+    await vi.waitFor(() => expect(useStore.getState().tasks[0].status).not.toBe('running'))
+  })
+
+  it('uses the default collection when the active one is deleted before a queued task starts', async () => {
+    const collectionA = { id: 'collection-a', name: '收藏夹 A', createdAt: 1, updatedAt: 1 }
+    const collectionB = { id: 'collection-b', name: '收藏夹 B', createdAt: 1, updatedAt: 1 }
+    const firstRequest = deferred<Awaited<ReturnType<typeof callImageApi>>>()
+    vi.mocked(callImageApi)
+      .mockImplementationOnce(() => firstRequest.promise)
+      .mockResolvedValue({ images: [], actualParams: {}, actualParamsList: [], revisedPrompts: [] })
+    useStore.setState({
+      appMode: 'gallery',
+      filterFavorite: true,
+      activeFavoriteCollectionId: collectionB.id,
+      favoriteCollections: [collectionA, collectionB],
+      defaultFavoriteCollectionId: collectionA.id,
+      settings: { ...useStore.getState().settings, showBatchPrompt: true, batchPromptEnabled: true, batchPromptMode: 'queue' },
+      prompt: 'first\n\n\nsecond',
+      inputImages: [],
+      params: { ...DEFAULT_PARAMS },
+    })
+
+    void submitTask()
+    await vi.waitFor(() => expect(callImageApi).toHaveBeenCalledOnce())
+    expect(useStore.getState().tasks[0]).toMatchObject({ prompt: 'first', favoriteCollectionIds: [collectionB.id] })
+    await deleteFavoriteCollection(collectionB.id)
+    firstRequest.resolve({ images: [], actualParams: {}, actualParamsList: [], revisedPrompts: [] })
+
+    await vi.waitFor(() => expect(useStore.getState().batchProgress).toBeNull())
+    expect(useStore.getState().tasks.find((item) => item.prompt === 'second')).toMatchObject({ favoriteCollectionIds: [collectionA.id], isFavorite: true })
   })
 
   it('creates a separate task for a failed one by default', async () => {
@@ -1417,6 +1518,7 @@ describe('fal task recovery', () => {
     await putDbTask(falTask)
     vi.mocked(getFalQueuedImageResult).mockResolvedValueOnce({
       images: ['data:image/png;base64,fal-recovered'],
+      searchGrounding: [{ sources: [{ uri: 'https://example.com/source', title: 'Source' }] }],
       actualParams: { output_format: 'png' },
       actualParamsList: [{ output_format: 'png' }],
       revisedPrompts: [],
@@ -1435,6 +1537,7 @@ describe('fal task recovery', () => {
       transparentOutput: true,
     })
     expect(recovered?.transparentOriginalImages).toHaveLength(1)
+    expect(recovered?.searchGrounding).toEqual([{ sources: [{ uri: 'https://example.com/source', title: 'Source' }] }])
     const outputImage = await getImage(recovered!.outputImages[0])
     const originalImage = await getImage(recovered!.transparentOriginalImages![0])
     expect(outputImage?.dataUrl).toBe('transparent:data:image/png;base64,fal-recovered')
@@ -5517,7 +5620,7 @@ describe('reused task API profile', () => {
     expect(getTaskApiProfile(useStore.getState().settings, sourceTask)).toMatchObject({
       id: profile.id,
       provider: 'provider-old',
-      model: 'gpt-image-2.5-sunburst',
+      model: DEFAULT_IMAGES_MODEL,
     })
   })
 
@@ -5987,5 +6090,89 @@ describe('privacy mode', () => {
     await vi.waitFor(() => expect(useStore.getState().tasks[0]?.status).toBe('error'))
     expect(showBrowserNotification).toHaveBeenCalledOnce()
     expect(useStore.getState().detailTaskId).toBe(useStore.getState().tasks[0].id)
+  })
+})
+
+describe('lightbox reference context', () => {
+  afterEach(() => useStore.getState().setLightboxImageId(null))
+
+  it('keeps markup and comments per task for the same image, and plain previews inherit no markup', () => {
+    const open = useStore.getState().setLightboxImageId
+    open('original', ['original'], 'comment A', { original: 'markup-a' })
+    expect(useStore.getState().lightboxMarkupIds).toEqual({ original: 'markup-a' })
+    open('original', ['original'], 'comment B', { original: 'markup-b' })
+    expect(useStore.getState().lightboxMarkupIds).toEqual({ original: 'markup-b' })
+    expect(useStore.getState().lightboxCommentPrompt).toBe('comment B')
+    open('original')
+    expect(useStore.getState().lightboxMarkupIds).toEqual({})
+    expect(useStore.getState().lightboxCommentPrompt).toBeNull()
+  })
+
+  it('clears markup context when the lightbox closes', () => {
+    useStore.getState().setLightboxImageId('original', ['original'], null, { original: 'markup' })
+    useStore.getState().setLightboxImageId(null)
+    expect(useStore.getState().lightboxMarkupIds).toEqual({})
+  })
+})
+
+
+describe('参考图数量限制入口', () => {
+  const images = Array.from({ length: 6 }, (_, idx) => ({ id: `limit-${idx}`, dataUrl: `data:image/png;base64,${idx}` }))
+  const profile = createDefaultFalProfile({ id: 'limit-fal', apiKey: 'test-key', model: 'xai/grok-imagine-image/v2.0' })
+
+  beforeEach(() => {
+    vi.mocked(callImageApi).mockClear()
+    useStore.setState({
+      settings: normalizeSettings({ ...DEFAULT_SETTINGS, profiles: [profile], activeProfileId: profile.id }),
+      appMode: 'gallery', prompt: '测试', inputImages: [], params: { ...DEFAULT_PARAMS }, tasks: [],
+      reusedTaskApiProfileId: null, reusedTaskApiModel: null, reusedTaskApiProfileMissing: false,
+      maskDraft: null, batchProgress: null, showToast: vi.fn(),
+    })
+  })
+
+  it('共用添加入口保留超限图片，重复图片不占名额', () => {
+    for (const img of images.slice(0, 5)) useStore.getState().addInputImage(img)
+    expect(() => useStore.getState().addInputImage(images[0])).not.toThrow()
+    expect(() => useStore.getState().addInputImage(images[5])).not.toThrow()
+    expect(useStore.getState().inputImages).toEqual(images)
+  })
+
+  it('切换到更低上限保留全部图片，提交前阻止请求且不创建任务', async () => {
+    useStore.getState().setInputImages(images)
+    useStore.getState().setSettings({ profiles: [{ ...profile, model: 'xai/grok-imagine-image' }] })
+    expect(useStore.getState().inputImages).toEqual(images)
+    expect(await submitTask()).toEqual([])
+    expect(useStore.getState().showToast).toHaveBeenCalledWith(expect.stringContaining('最多支持 3 张'), 'error')
+    expect(callImageApi).not.toHaveBeenCalled()
+    expect(useStore.getState().tasks).toEqual([])
+    expect(useStore.getState().inputImages).toEqual(images)
+  })
+
+  it('命令行直接提交同样校验，不修改输入草稿', async () => {
+    useStore.getState().addInputImage(images[0])
+    expect(await submitTask({ input: { prompts: ['测试'], inputImages: images } })).toEqual([])
+    expect(callImageApi).not.toHaveBeenCalled()
+    expect(useStore.getState().inputImages).toEqual([images[0]])
+  })
+
+  it('重试超限任务不会覆盖已有结果', async () => {
+    const source = task({ inputImageIds: images.map((img) => img.id), outputImages: ['existing-output'] })
+    useStore.setState({ tasks: [source] })
+    await retryTask(source)
+    expect(useStore.getState().tasks).toEqual([source])
+    expect(callImageApi).not.toHaveBeenCalled()
+    expect(useStore.getState().showToast).toHaveBeenCalledWith(expect.stringContaining('最多支持 5 张'), 'error')
+  })
+
+  it('Agent 混合模式按图像配置校验，保留超限草稿', async () => {
+    const textProfile = createDefaultOpenAIProfile({ id: 'text', apiKey: 'test-key', apiMode: 'responses' })
+    useStore.setState({
+      settings: normalizeSettings({ ...DEFAULT_SETTINGS, profiles: [textProfile, profile], activeProfileId: textProfile.id, agentApiConfigMode: 'hybrid', agentTextProfileId: textProfile.id, agentImageProfileId: profile.id }),
+      appMode: 'agent', inputImages: images,
+    })
+    await submitAgentMessage()
+    expect(useStore.getState().showToast).toHaveBeenCalledWith(expect.stringContaining('最多支持 5 张'), 'error')
+    expect(useStore.getState().inputImages).toEqual(images)
+    expect(callImageApi).not.toHaveBeenCalled()
   })
 })

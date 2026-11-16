@@ -5,7 +5,8 @@ import { getImage, registerImage } from './db.js'
 
 /** 图片 id 只允许安全字符，避免路径穿越 */
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/
-const ALLOWED_EXT = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif'])
+/** GPT Image 2.6 起还要支持 gif 动图与 svg 矢量输出 */
+const ALLOWED_EXT = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif', 'svg'])
 const EXT_BY_MIME: Record<string, string> = {
   'image/png': 'png',
   'image/jpeg': 'jpg',
@@ -14,6 +15,23 @@ const EXT_BY_MIME: Record<string, string> = {
   'image/gif': 'gif',
   'image/bmp': 'bmp',
   'image/avif': 'avif',
+  'image/svg+xml': 'svg',
+}
+
+const MIME_BY_EXT: Record<string, string> = {
+  png: 'image/png',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  webp: 'image/webp',
+  gif: 'image/gif',
+  bmp: 'image/bmp',
+  avif: 'image/avif',
+  svg: 'image/svg+xml',
+}
+
+/** 扩展名转 Content-Type；svg 必须带 +xml，否则浏览器不认 */
+export function contentTypeForExt(ext: string): string {
+  return MIME_BY_EXT[normalizeExt(ext)] ?? 'application/octet-stream'
 }
 
 export function isValidImageId(id: string): boolean {

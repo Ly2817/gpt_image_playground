@@ -1,6 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-import { MAX_INPUT_IMAGES, type ApiProfile, type AppSettings, type InputImage, type TaskParams } from '../types'
+import { GIF_FRAME_COUNT_RANGE, GIF_FRAME_DURATION_RANGE, IMAGE_COMPLEXITIES, OUTPUT_FORMATS, type ApiProfile, type AppSettings, type InputImage, type TaskParams } from '../types'
 import {
   createDefaultOpenAIProfile,
   getActiveApiProfile,
@@ -12,6 +12,11 @@ import {
 } from './apiProfiles'
 import { requestBrowserNotificationPermission } from './browserNotification'
 import { ensureImageCached } from './imageCache'
+import { toReferenceImage } from './inputImages'
+import { assertInputImageLimit } from './inputImageLimits'
+import { normalizeParamsForSettings, supportsTransparentOutput } from './paramCompatibility'
+import { getImageModelFamily } from './imageModels'
+import { normalizeSeedreamImageSize, SEEDREAM_RESOLUTIONS } from './size'
 import { getProxySetting, setProxySetting } from './networkProxy'
 import { getPresetProfileIds, isPresetConfigOnlyEnabled, isPresetProfileLocked, isPresetProvider, isPresetProviderLocked } from './presetConfig'
 import {
@@ -45,7 +50,7 @@ interface CliReply {
 // API 配置、自定义服务商和启用的配置由各自的参数或工具修改
 const SETTING_KEYS = [
   'providerOrder', 'clearInputAfterSubmit', 'persistInputOnRestart', 'reuseTaskApiProfileTemporarily', 'alwaysShowRetryButton',
-  'retryMode', 'allowPromptRewrite', 'taskCompletionNotification', 'autoCheckUpdate', 'writeLogFile', 'enterSubmit',
+  'saveTasksToActiveFavoriteCollection', 'retryMode', 'allowPromptRewrite', 'imagePromptHints', 'taskCompletionNotification', 'autoCheckUpdate', 'writeLogFile', 'enterSubmit',
   'privacyModeShortcut', 'colorMode', 'uiFont', 'uiFontName', 'monoFont', 'monoFontName', 'showBatchPrompt', 'batchPromptEnabled',
   'batchPromptMode', 'batchPromptConcurrencyLimited', 'batchPromptConcurrency', 'referenceImageEditAction', 'zipDownloadRoutes',
   'saveLocationMode', 'agentScrollToBottomAfterSubmit', 'agentMaxToolRounds', 'agentWebSearch', 'agentMathFormattingPrompt',
@@ -54,11 +59,10 @@ const SETTING_KEYS = [
 
 const PROFILE_FIELDS = new Set([
   'name', 'provider', 'baseUrl', 'apiKey', 'model', 'selectedModel', 'imageGenerationModel', 'timeout', 'apiMode',
-  'reasoningEffort', 'codexCli', 'apiProxy', 'responseFormatB64Json', 'streamImages', 'streamPartialImages', 'transparentBackgroundMethod',
+  'reasoningEffort', 'codexCli', 'apiProxy', 'responseFormatB64Json', 'streamImages', 'streamPartialImages', 'transparentBackgroundMethod', 'svgModel', 'svgReasoningEffort',
 ])
 
 const QUALITIES = ['auto', 'low', 'medium', 'high', 'xhigh', 'max']
-const OUTPUT_FORMATS = ['png', 'jpeg', 'webp']
 
 const text = (value: string): CliReply => ({ text: value, data: { message: value } })
 const json = (value: unknown): CliReply => ({ text: JSON.stringify(value, null, 2), data: value })
@@ -91,19 +95,42 @@ function describeProfile(settings: AppSettings, profile: ApiProfile) {
 }
 
 /** 校验并解析生图参数，只返回传入的字段 */
-function parseParams(args: Record<string, unknown>) {
+function parseParams(args: Record<string, unknown>, profile = getActiveApiProfile(getSettings())) {
   const patch: Partial<TaskParams> = {}
   if (args.size !== undefined) {
     if (typeof args.size !== 'string' || !args.size.trim()) throw new Error('size 必须是非空字符串')
     patch.size = args.size.trim()
+    if (getImageModelFamily(profile) === 'seedream') {
+      const size = patch.size.toUpperCase()
+      if (size === 'AUTO' || (SEEDREAM_RESOLUTIONS as readonly string[]).includes(size)) {
+        patch.aspect_ratio = 'auto'
+        if (size !== 'AUTO') patch.resolution = size
+      } else {
+        if (!normalizeSeedreamImageSize(patch.size)) throw new Error(`Seedream size 必须是 auto、${SEEDREAM_RESOLUTIONS.join('、')} 或正整数宽高（如 1281x721）`)
+        patch.aspect_ratio = 'custom'
+        patch.resolution = undefined
+      }
+    }
   }
   if (args.quality !== undefined) {
     if (typeof args.quality !== 'string' || !QUALITIES.includes(args.quality)) throw new Error(`quality 只能是 ${QUALITIES.join('、')}`)
     patch.quality = args.quality as TaskParams['quality']
   }
+  if (args.complexity !== undefined) {
+    if (!IMAGE_COMPLEXITIES.includes(args.complexity as TaskParams['complexity'])) throw new Error(`complexity 只能是 ${IMAGE_COMPLEXITIES.join('、')}`)
+    patch.complexity = args.complexity as TaskParams['complexity']
+  }
   if (args.output_format !== undefined) {
-    if (typeof args.output_format !== 'string' || !OUTPUT_FORMATS.includes(args.output_format)) throw new Error(`output_format 只能是 ${OUTPUT_FORMATS.join('、')}`)
+    if (!OUTPUT_FORMATS.includes(args.output_format as TaskParams['output_format'])) throw new Error(`output_format 只能是 ${OUTPUT_FORMATS.join('、')}`)
     patch.output_format = args.output_format as TaskParams['output_format']
+  }
+  for (const [key, range] of [['frame_count', GIF_FRAME_COUNT_RANGE], ['frame_duration_ms', GIF_FRAME_DURATION_RANGE]] as const) {
+    const value = args[key]
+    if (value === undefined) continue
+    if (typeof value !== 'number' || !Number.isInteger(value) || value < range.min || value > range.max) {
+      throw new Error(`${key} 必须是 ${range.min}–${range.max} 的整数`)
+    }
+    patch[key] = value
   }
   if (args.moderation !== undefined) {
     if (args.moderation !== 'auto' && args.moderation !== 'low') throw new Error('moderation 只能是 auto、low')
@@ -123,10 +150,20 @@ function parseParams(args: Record<string, unknown>) {
   if (args.transparent_output !== undefined) {
     if (typeof args.transparent_output !== 'boolean') throw new Error('transparent_output 必须是 true 或 false')
     patch.transparent_output = args.transparent_output
+    if (getImageModelFamily(profile) === 'seedream') patch.background = args.transparent_output ? 'transparent' : 'opaque'
+  }
+  if (args.watermark !== undefined && getImageModelFamily(profile) === 'seedream') {
+    if (typeof args.watermark !== 'boolean') throw new Error('watermark 必须是 true 或 false')
+    patch.watermark = args.watermark
+  }
+  if (args.background !== undefined && getImageModelFamily(profile) === 'seedream') {
+    if (args.background !== 'auto' && args.background !== 'transparent' && args.background !== 'opaque') throw new Error('background 只能是 auto、transparent、opaque')
+    patch.background = args.background
+    patch.transparent_output = args.background === 'transparent'
   }
   const format = patch.output_format ?? useStore.getState().params.output_format
-  if (patch.transparent_output && format !== 'png' && format !== 'webp') {
-    throw new Error('透明背景只支持 png 或 webp 格式')
+  if (patch.transparent_output && format === 'jpeg') {
+    throw new Error('透明背景不支持 jpeg 格式')
   }
   return patch
 }
@@ -154,7 +191,14 @@ async function generateImage(requestId: number, args: Record<string, unknown>): 
   if (useStore.getState().batchProgress) throw new Error('应用正在批量提交任务，请等它完成后再试')
 
   const references = Array.isArray(args.reference_images) ? args.reference_images : []
-  if (references.length > MAX_INPUT_IMAGES) throw new Error(`参考图最多 ${MAX_INPUT_IMAGES} 张`)
+  assertInputImageLimit(getActiveApiProfile(getSettings()), references.length)
+  const params = parseParams(args)
+  // 与 submitTask 相同：按提交时的配置规范化后再检查，不支持 SVG 的模型会自动改用 PNG
+  const settings = getSettings()
+  const finalParams = normalizeParamsForSettings({ ...useStore.getState().params, ...params }, settings, { hasInputImages: references.length > 0 })
+  if (finalParams.transparent_output && !supportsTransparentOutput(settings, getActiveApiProfile(settings), finalParams.output_format)) {
+    throw new Error('当前自定义服务商未映射 $params.background，SVG 和 GIF 无法使用透明背景，请关闭透明背景或换用 PNG、WebP')
+  }
   const inputImages: InputImage[] = []
   for (const item of references) {
     if (typeof item !== 'string') throw new Error('参考图中有无法识别的项')
@@ -168,10 +212,9 @@ async function generateImage(requestId: number, args: Record<string, unknown>): 
     }
     const dataUrl = await ensureImageCached(item)
     if (!dataUrl) throw new Error(`找不到参考图中的图片 ID：${item}`)
-    inputImages.push({ id: item, dataUrl })
+    inputImages.push(await toReferenceImage(item, dataUrl))
   }
 
-  const params = parseParams(args)
   if (Object.keys(params).length) useStore.getState().setParams(params)
   const taskIds = await submitTask({ input: { prompts, inputImages } })
   if (!taskIds.length) throw new Error('应用没有创建任务，原因见应用中的提示')
@@ -272,7 +315,9 @@ async function updateSettings(args: Record<string, unknown>) {
     const result = await requestBrowserNotificationPermission()
     if (!result.ok) throw new Error('系统没有允许通知，无法开启任务完成通知')
   }
-  const params = isObject(args.params) ? parseParams(args.params) : {}
+  const params = isObject(args.params)
+    ? parseParams(args.params, getActiveApiProfile(normalizeSettings({ ...settings, activeProfileId: activeId ?? settings.activeProfileId })))
+    : {}
   if (isObject(args.proxy)) {
     const proxy = { ...await getProxySetting(), ...args.proxy }
     if (proxy.mode !== 'system' && proxy.mode !== 'none' && proxy.mode !== 'custom') throw new Error('proxy.mode 只能是 system、none、custom')
@@ -313,7 +358,7 @@ function saveApiProfile(args: Record<string, unknown>) {
   const base = existing ?? createDefaultOpenAIProfile({ id: newId('openai'), name: '新配置' })
   const provider = typeof fields.provider === 'string' ? fields.provider : base.provider
   const customProvider = getCustomProviderDefinition(settings, provider)
-  if (!['openai', 'sb2api-async', 'fal'].includes(provider) && !customProvider) throw new Error(`没有这个服务商：${provider}`)
+  if (!['openai', 'google', 'xai', 'bytedance', 'sb2api-async', 'fal'].includes(provider) && !customProvider) throw new Error(`没有这个服务商：${provider}`)
   const switched = provider === base.provider ? base : switchApiProfileProvider(base, provider, customProvider ?? undefined)
   const profile = { ...switched, ...fields, provider } as ApiProfile
   if (fields.selectedModel !== undefined && !splitModelList(profile.model).includes(String(fields.selectedModel))) {

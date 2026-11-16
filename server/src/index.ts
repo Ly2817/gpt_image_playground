@@ -21,7 +21,7 @@ import {
   upsertRecord,
   type StoredProfile,
 } from './db.js'
-import { extFromMime, isValidImageId, loadImage, normalizeExt, saveImage } from './storage.js'
+import { contentTypeForExt, extFromMime, isValidImageId, loadImage, normalizeExt, saveImage } from './storage.js'
 import { serveIndexHtml, serveStatic } from './static.js'
 
 const startedAt = Date.now()
@@ -154,8 +154,13 @@ function handleImageDownload(res: ServerResponse, imageId: string) {
   if (!isValidImageId(imageId)) return fail(res, 400, '非法的图片 id')
   const image = loadImage(imageId)
   if (!image) return fail(res, 404, '图片不存在')
-  res.setHeader('Content-Type', `image/${image.ext === 'jpg' ? 'jpeg' : image.ext}`)
+  res.setHeader('Content-Type', contentTypeForExt(image.ext))
   res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  // SVG 可能内嵌脚本，直接访问这个地址时不能让它在本站源下执行
+  if (image.ext === 'svg') {
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:")
+  }
   res.setHeader('Content-Length', image.bytes)
   res.writeHead(200)
   res.end(image.buffer)

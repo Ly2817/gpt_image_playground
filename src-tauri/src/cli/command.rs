@@ -15,8 +15,9 @@ use serde_json::{json, Map, Value};
 
 const USAGE: &str = "用法：
   gpt-image-playground generate <提示词> [--prompt <提示词>]… [--image <图片>]… [--size <尺寸>]
-                                [--quality <质量>] [-n <数量>] [--format png|jpeg|webp] [--compression <0-100>]
-                                [--moderation auto|low] [--transparent] [--output <目录>] [--json]
+                                [--quality <质量>] [--complexity auto|low|medium|high] [-n <数量>]
+                                [--format png|jpeg|webp|svg|gif] [--frames <2-16>] [--frame-duration <20-2000>]
+                                [--compression <0-100>] [--moderation auto|low] [--transparent] [--output <目录>] [--json]
   gpt-image-playground history [<任务 ID>…] [--limit <数量>] [--offset <数量>] [--json]
   gpt-image-playground image <图片 ID 或任务 ID> [--output <目录>] [--json]
   gpt-image-playground settings [--json]                  设置、生图参数、API 配置、自定义服务商与代理
@@ -29,7 +30,7 @@ const USAGE: &str = "用法：
 
   用正在运行的 GPT Image Playground 生图、查看历史记录、查看和修改设置，效果与在应用里操作相同；应用需要保持打开。
   generate 用应用启用的 API 配置生图，提交后先输出任务 ID，全部任务结束后输出图片文件的路径；给出的参数会保存为应用的参数。
-  多个 --prompt 按应用的批量提交方式一起提交。--image 为参考图：本机图片路径或历史记录中的图片 ID，可重复，最多 16 张。
+  多个 --prompt 按应用的批量提交方式一起提交。--image 为参考图：本机图片路径或历史记录中的图片 ID，可重复，数量上限按应用当前启用的模型确定；超限时返回错误，不创建任务。
   质量：auto、low、medium、high、xhigh、max。--output 把结果图片另外复制到该目录。history 给出任务 ID 时只列出这些任务。
   settings set 的键：设置项名，params.<参数名>，proxy.mode、proxy.url；值按 JSON 解析，不是 JSON 时当作字符串。
   <JSON> 为 API 配置或服务商的字段，写 - 时从标准输入读取。profile save 不带 --id 时新建，新建的配置默认启用。
@@ -112,7 +113,8 @@ pub fn parse(
     }
     let allowed: &[&str] = match (cmd.as_str(), words.first().map(String::as_str)) {
         ("generate", _) => &[
-            "--prompt", "--image", "--size", "--quality", "-n", "--format", "--compression", "--moderation", "--transparent", "--output",
+            "--prompt", "--image", "--size", "--quality", "--complexity", "-n", "--format", "--frames", "--frame-duration", "--compression",
+            "--moderation", "--transparent", "--output",
         ],
         ("history", _) => &["--limit", "--offset"],
         ("image", _) => &["--output"],
@@ -159,6 +161,9 @@ pub fn parse(
             }
             "--size" => ("size", value.into()),
             "--quality" => ("quality", value.into()),
+            "--complexity" => ("complexity", value.into()),
+            "--frames" => ("frame_count", int(&flag, &value, 2, 16)?.into()),
+            "--frame-duration" => ("frame_duration_ms", int(&flag, &value, 20, 2000)?.into()),
             "-n" => ("n", int(&flag, &value, 1, 100)?.into()),
             "--format" => ("output_format", value.into()),
             "--compression" => ("output_compression", int(&flag, &value, 0, 100)?.into()),

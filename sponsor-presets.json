@@ -43,9 +43,18 @@
       "name": "默认",
       "provider": "openai",
       "baseUrl": "https://api.openai.com/v1",
-      "model": "gpt-image-2.5-sunburst",
+      "model": "gpt-image-2.6-sunburst",
       "apiMode": "images",
       "isDefault": true
+    },
+    {
+      "id": "apimart",
+      "name": "APIMart",
+      "description": "[APIMart](https://go.apimart.ai/gh-gpt_image_playground) 是专注 AI 图片/视频生成的低价 API 平台，GPT-Image-2 低至 $0.006/张，1 美元可出图 160+ 张。图片、视频一套异步 API 通吃，提交任务拿 ID、回调取结果，跑批万张不超时、换模型不改代码。按量付费、无月费，通过[此注册链接](https://go.apimart.ai/gh-gpt_image_playground)注册即可开用。",
+      "provider": "custom-apimart",
+      "baseUrl": "https://api.apimart.ai/v1",
+      "model": "gpt-image-2",
+      "apiMode": "images"
     },
     {
       "id": "moyuu-ai",
@@ -62,16 +71,7 @@
       "description": "[JuCodex](https://jucodex.com/register?aff=3JDW) 为企业级用户打造的高可用、低延迟、极致性价比的中转站，提供 Codex、Claude Code、Grok 等主流大模型中转服务，新用户注册送 3 元（QQ 邮箱），永久承诺 0 水 0 替、模型 100% 保真。[生图工作台](https://image.jucodex.com)",
       "provider": "openai",
       "baseUrl": "https://api.sz-link.com/v1",
-      "model": "gpt-image-2.5-sunburst",
-      "apiMode": "images"
-    },
-    {
-      "id": "apimart",
-      "name": "APIMart",
-      "description": "[APIMart](https://go.apimart.ai/gh-gpt_image_playground) 是专注 AI 图片/视频生成的低价 API 平台，GPT-Image-2 低至 $0.006/张，1 美元可出图 160+ 张。图片、视频一套异步 API 通吃，提交任务拿 ID、回调取结果，跑批万张不超时、换模型不改代码。按量付费、无月费，通过[此注册链接](https://go.apimart.ai/gh-gpt_image_playground)注册即可开用。",
-      "provider": "custom-apimart",
-      "baseUrl": "https://api.apimart.ai/v1",
-      "model": "gpt-image-2",
+      "model": "gpt-image-2.6-sunburst, gpt-image-2.6-flare",
       "apiMode": "images"
     },
     {

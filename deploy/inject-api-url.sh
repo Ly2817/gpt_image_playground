@@ -27,6 +27,11 @@ if [ "$SHOW_PRESET_CONFIG_ONLY" = "true" ] || [ "$SHOW_DEFAULT_CONFIG_ONLY" = "t
     PRESET_CONFIG_ONLY=true
 fi
 
+CONFIG_CHANGE_DIALOG=true
+if [ "$SHOW_CONFIG_CHANGE_DIALOG" = "false" ]; then
+    CONFIG_CHANGE_DIALOG=false
+fi
+
 PRESET_CONFIG_PARAMS_LOCKED=false
 if [ "$LOCK_PRESET_CONFIG_PARAMS" = "true" ]; then
     PRESET_CONFIG_PARAMS_LOCKED=true
@@ -96,6 +101,7 @@ find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_API_PROXY_
 find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_DOCKER_DEPLOYMENT_PLACEHOLDER__|true|g" {} +
 find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_DOCKER_LEGACY_API_URL_USED_PLACEHOLDER__|$DOCKER_LEGACY_API_URL_USED|g" {} +
 find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_SHOW_PRESET_CONFIG_ONLY_PLACEHOLDER__|$PRESET_CONFIG_ONLY|g" {} +
+find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_SHOW_CONFIG_CHANGE_DIALOG_PLACEHOLDER__|$CONFIG_CHANGE_DIALOG|g" {} +
 find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_LOCK_PRESET_CONFIG_PARAMS_PLACEHOLDER__|$PRESET_CONFIG_PARAMS_LOCKED|g" {} +
 find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_PREVENT_PRESET_CONFIG_DELETION_PLACEHOLDER__|$PRESET_CONFIG_DELETION_PREVENTED|g" {} +
 find "$STATIC_DIR/assets" -type f -name "*.js" -exec sed -i "s|__VITE_DEFAULT_UI_FONT_PLACEHOLDER__|$DEFAULT_UI_FONT_ESCAPED|g" {} +

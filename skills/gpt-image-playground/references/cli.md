@@ -8,21 +8,24 @@
 
 ```
 gpt-image-playground generate <提示词> [--prompt <提示词>]… [--image <图片>]… [--size <尺寸>]
-                              [--quality <质量>] [-n <数量>] [--format png|jpeg|webp] [--compression <0-100>]
-                              [--moderation auto|low] [--transparent] [--output <目录>] [--json]
+                              [--quality <质量>] [--complexity auto|low|medium|high] [-n <数量>]
+                              [--format png|jpeg|webp|svg|gif] [--frames <2-16>] [--frame-duration <20-2000>]
+                              [--compression <0-100>] [--moderation auto|low] [--transparent] [--output <目录>] [--json]
 ```
 
 | 参数 | 说明 |
 |---|---|
 | `<提示词>` | 可以不加引号直接写多个词 |
 | `--prompt` | 再加一条提示词，可重复；多条按应用的批量方式提交，一条失败不影响其他 |
-| `--image` | 参考图，可重复，最多 16 张：本机图片（png、jpg、webp、gif，相对路径按当前目录）或历史记录中的图片 ID |
-| `--size` | 如 `1024x1024`、`1536x1024`、`1024x1536`、`auto` |
+| `--image` | 参考图，可重复：本机图片（png、jpg、webp、gif，相对路径按当前目录）或历史记录中的图片 ID；数量上限按当前启用的模型确定，超限时返回错误，不创建任务 |
+| `--size` | 如 `1024x1024`、`1536x1024`、`1024x1536`、`auto`；Seedream 5.5 还可用 `1K`、`1.5K`、`2K` 或任意宽高 |
 | `--quality` | `auto`、`low`、`medium`、`high`、`xhigh`、`max`；`xhigh`、`max` 只有部分模型支持，其余按 `high` |
+| `--complexity` | 模型渲染前的规划程度，只有 GPT Image 2.6 支持，其他模型按 `auto`（不发送）处理 |
 | `-n` | 每个任务的张数 |
-| `--format`、`--compression` | 输出格式；`jpeg`、`webp` 的压缩质量 0–100 |
+| `--format`、`--compression` | 输出格式；`jpeg`、`webp` 的压缩质量 0–100。`svg`、`gif` 只有 GPT Image 2.6 支持，均可用于文生图和参考图编辑，`gif` 不能使用遮罩 |
+| `--frames`、`--frame-duration` | GIF 的帧数和每帧毫秒数，默认 9 帧、200 ms |
 | `--moderation` | `auto` 或 `low` |
-| `--transparent` | 透明背景，需要 `png` 或 `webp` |
+| `--transparent` | 透明背景，不支持 `jpeg`；自定义供应商未映射 `$params.background` 时 `svg`、`gif` 也不支持 |
 | `--output` | 把结果图片另外复制到这个目录，不存在时创建；文件名为 `task-<任务 ID>`，一个任务有多张时加 `-01`、`-02` |
 
 给出的参数会保存为应用的参数。批量任务进行中时应用不接受新的生图。

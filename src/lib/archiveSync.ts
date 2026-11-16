@@ -92,6 +92,7 @@ function extOf(blob: Blob): string {
   if (type.includes('gif')) return 'gif'
   if (type.includes('bmp')) return 'bmp'
   if (type.includes('avif')) return 'avif'
+  if (type.includes('svg')) return 'svg'
   return 'png'
 }
 
